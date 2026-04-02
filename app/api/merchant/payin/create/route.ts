@@ -20,7 +20,7 @@ export async function POST(req: Request) {
 
     const { db } = await connectToDatabase()
     const user = await db.collection('User').findOne({ _id: new ObjectId(userData.id) })
-
+    
     if (!user || !user.merchantId) {
       return NextResponse.json({ error: 'Merchant not found' }, { status: 404 })
     }
@@ -48,7 +48,7 @@ export async function POST(req: Request) {
       type: 'PAYIN',
       status: 'PENDING',
       currency: 'INR',
-      gateway: 'Channel 2',
+      gateway: 'Channel 1',
       createdAt: new Date(),
       updatedAt: new Date(),
     }
@@ -56,60 +56,60 @@ export async function POST(req: Request) {
     const txnResult = await db.collection('Transaction').insertOne(internalTransaction)
     const internalId = txnResult.insertedId.toString()
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'
     const payInData = {
-      mchId: '',
+      mchId: '', // Handled by utility from env
       amount: internalTransaction.amount,
       orderNumber: internalTransaction.orderNumber,
-      notifyUrl: `${baseUrl}/api/callback/okpay/payin`,
-      returnUrl: `${baseUrl}/merchant/payin`,
-      internalId,
+      notifyUrl: `${process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'}/api/callback/okpay/payin`,
+      returnUrl: `${process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'}/merchant/payin`,
+      internalId: internalId
     }
 
-    let result: any
-    let gatewayUsed = 'Channel 2'
+    let result: any;
+    let gatewayUsed = 'Channel 1';
 
     try {
-      console.log('Attempting Channel 2 (VeloPay)...')
+      // Attempt Channel 1 (OkPay)
+      console.log('Attempting Channel 1 (OkPay)...');
+      result = await initiateOkPayPayIn(payInData);
+      
+      if (result.code !== 0) {
+        throw new Error(result.msg || 'OkPay failed');
+      }
+    } catch (okPayError) {
+      console.error('Channel 1 failed, attempting failover to Channel 2 (VeloPay):', okPayError);
+      
+      gatewayUsed = 'Channel 2';
       const veloPayData = {
         ...payInData,
-        notifyUrl: `${baseUrl}/api/callback/velopay/payin`,
+        notifyUrl: `${process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'}/api/callback/velopay/payin`,
       }
-      const veloRaw = await initiateVeloPayPayIn(veloPayData)
-
-      if (veloRaw.status !== 'SUCCESS') {
-        throw new Error(veloRaw.message || veloRaw.msg || 'VeloPay failed')
-      }
-      if (!veloRaw.pay_link) {
-        throw new Error('VeloPay: no pay_link in response')
-      }
-
-      result = {
-        code: 0,
-        data: {
-          url: veloRaw.pay_link,
-          transaction_Id: veloRaw.id,
-        },
-      }
-    } catch (veloPayError) {
-      console.error('Channel 2 failed, attempting failover to Channel 1 (OkPay):', veloPayError)
-
-      gatewayUsed = 'Channel 1'
+      
       try {
-        result = await initiateOkPayPayIn(payInData)
-
-        if (result.code !== 0) {
-          throw new Error(result.msg || 'OkPay failed')
+        result = await initiateVeloPayPayIn(veloPayData);
+        
+        // VeloPay response structure: { status: "SUCCESS", message: "...", pay_link: "...", id: "..." }
+        if (result.status !== 'SUCCESS') {
+          throw new Error(result.message || result.msg || 'VeloPay failed');
         }
-      } catch (okPayError: any) {
-        console.error('Channel 1 also failed:', okPayError)
-
+        
+        // Normalize result for the rest of the logic
+        result = {
+          code: 0,
+          data: {
+            url: result.pay_link,
+            transaction_Id: result.id
+          }
+        };
+      } catch (veloPayError: any) {
+        console.error('Channel 2 also failed:', veloPayError);
+        
         await db.collection('Transaction').updateOne(
           { _id: txnResult.insertedId },
           {
             $set: {
               status: 'FAILED',
-              failureReason: `Failover failed. Ch2: ${veloPayError instanceof Error ? veloPayError.message : 'Unknown'}, Ch1: ${okPayError?.message || 'Unknown'}`,
+              failureReason: `Failover failed. Ch1: ${okPayError instanceof Error ? okPayError.message : 'Unknown'}, Ch2: ${veloPayError.message || 'Unknown'}`,
               updatedAt: new Date(),
             },
           }
@@ -118,6 +118,7 @@ export async function POST(req: Request) {
       }
     }
 
+    // Success with either gateway
     await db.collection('Transaction').updateOne(
       { _id: txnResult.insertedId },
       {
@@ -133,8 +134,9 @@ export async function POST(req: Request) {
       success: true,
       paymentUrl: result.data.url,
       transactionId: result.data.transaction_Id,
-      channel: gatewayUsed,
+      channel: gatewayUsed
     })
+
   } catch (error) {
     console.error('Create payin error:', error)
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
