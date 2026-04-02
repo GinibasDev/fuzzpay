@@ -20,7 +20,7 @@ export async function POST(req: Request) {
 
     const { db } = await connectToDatabase()
     const user = await db.collection('User').findOne({ _id: new ObjectId(userData.id) })
-    
+
     if (!user || !user.merchantId) {
       return NextResponse.json({ error: 'Merchant not found' }, { status: 404 })
     }
@@ -48,7 +48,7 @@ export async function POST(req: Request) {
       type: 'PAYIN',
       status: 'PENDING',
       currency: 'INR',
-      gateway: 'Channel 1',
+      gateway: 'PENDING',
       createdAt: new Date(),
       updatedAt: new Date(),
     }
@@ -56,69 +56,80 @@ export async function POST(req: Request) {
     const txnResult = await db.collection('Transaction').insertOne(internalTransaction)
     const internalId = txnResult.insertedId.toString()
 
-    const payInData = {
-      mchId: '', // Handled by utility from env
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'
+    const basePayInData = {
+      mchId: '',
       amount: internalTransaction.amount,
       orderNumber: internalTransaction.orderNumber,
-      notifyUrl: `${process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'}/api/callback/okpay/payin`,
-      returnUrl: `${process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'}/merchant/payin`,
-      internalId: internalId
+      returnUrl: `${baseUrl}/merchant/payin`,
+      internalId,
     }
 
-    let result: any;
-    let gatewayUsed = 'Channel 1';
+    async function tryOkPay(): Promise<{ gateway: string; result: { data: { url: string; transaction_Id: string } } }> {
+      const res = await initiateOkPayPayIn({
+        ...basePayInData,
+        notifyUrl: `${baseUrl}/api/callback/okpay/payin`,
+      })
+      if (res.code !== 0) {
+        throw new Error(res.msg || 'OkPay failed')
+      }
+      return { gateway: 'Channel 1', result: res }
+    }
 
-    try {
-      // Attempt Channel 1 (OkPay)
-      console.log('Attempting Channel 1 (OkPay)...');
-      result = await initiateOkPayPayIn(payInData);
-      
-      if (result.code !== 0) {
-        throw new Error(result.msg || 'OkPay failed');
+    async function tryVeloPay(): Promise<{ gateway: string; result: { data: { url: string; transaction_Id: string } } }> {
+      const raw = await initiateVeloPayPayIn({
+        ...basePayInData,
+        notifyUrl: `${baseUrl}/api/callback/velopay/payin`,
+      })
+      if (raw.status !== 'SUCCESS') {
+        throw new Error(raw.message || raw.msg || 'VeloPay failed')
       }
-    } catch (okPayError) {
-      console.error('Channel 1 failed, attempting failover to Channel 2 (VeloPay):', okPayError);
-      
-      gatewayUsed = 'Channel 2';
-      const veloPayData = {
-        ...payInData,
-        notifyUrl: `${process.env.NEXT_PUBLIC_APP_URL || 'https://fuzzpay.vercel.app'}/api/callback/velopay/payin`,
+      const result = {
+        data: {
+          url: raw.pay_link,
+          transaction_Id: raw.id,
+        },
       }
-      
+      return { gateway: 'Channel 2', result }
+    }
+
+    const tryOkFirst = Math.random() < 0.5
+    const attempts = tryOkFirst ? [tryOkPay, tryVeloPay] : [tryVeloPay, tryOkPay]
+    const channelLabels = tryOkFirst ? ['Channel 1 (OkPay)', 'Channel 2 (VeloPay)'] : ['Channel 2 (VeloPay)', 'Channel 1 (OkPay)']
+
+    console.log(`Payin gateway order (random): ${channelLabels.join(' → ')}`)
+
+    const errors: string[] = []
+    let gatewayUsed = ''
+    let result: { data: { url: string; transaction_Id: string } } | null = null
+
+    for (let i = 0; i < attempts.length; i++) {
       try {
-        result = await initiateVeloPayPayIn(veloPayData);
-        
-        // VeloPay response structure: { status: "SUCCESS", message: "...", pay_link: "...", id: "..." }
-        if (result.status !== 'SUCCESS') {
-          throw new Error(result.message || result.msg || 'VeloPay failed');
-        }
-        
-        // Normalize result for the rest of the logic
-        result = {
-          code: 0,
-          data: {
-            url: result.pay_link,
-            transaction_Id: result.id
-          }
-        };
-      } catch (veloPayError: any) {
-        console.error('Channel 2 also failed:', veloPayError);
-        
-        await db.collection('Transaction').updateOne(
-          { _id: txnResult.insertedId },
-          {
-            $set: {
-              status: 'FAILED',
-              failureReason: `Failover failed. Ch1: ${okPayError instanceof Error ? okPayError.message : 'Unknown'}, Ch2: ${veloPayError.message || 'Unknown'}`,
-              updatedAt: new Date(),
-            },
-          }
-        )
-        return NextResponse.json({ error: 'Payment gateway unavailable. Please try again later.' }, { status: 503 })
+        const out = await attempts[i]()
+        gatewayUsed = out.gateway
+        result = out.result
+        break
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        errors.push(`${channelLabels[i]}: ${msg}`)
+        console.error(`Payin ${channelLabels[i]} failed:`, e)
       }
     }
 
-    // Success with either gateway
+    if (!result) {
+      await db.collection('Transaction').updateOne(
+        { _id: txnResult.insertedId },
+        {
+          $set: {
+            status: 'FAILED',
+            failureReason: errors.join(' | '),
+            updatedAt: new Date(),
+          },
+        }
+      )
+      return NextResponse.json({ error: 'Payment gateway unavailable. Please try again later.' }, { status: 503 })
+    }
+
     await db.collection('Transaction').updateOne(
       { _id: txnResult.insertedId },
       {
@@ -134,11 +145,11 @@ export async function POST(req: Request) {
       success: true,
       paymentUrl: result.data.url,
       transactionId: result.data.transaction_Id,
-      channel: gatewayUsed
+      channel: gatewayUsed,
     })
-
   } catch (error) {
     console.error('Create payin error:', error)
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
   }
 }
+
